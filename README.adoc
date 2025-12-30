@@ -1,0 +1,244 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+= zig-fuse-ext
+:toc:
+
+image:https://img.shields.io/badge/RSR-Bronze-cd7f32[RSR Bronze]
+image:https://img.shields.io/badge/Language-Zig-f7a41d[Zig]
+
+Extended Zig FUSE bindings with cloud-optimized features.
+
+== Goal
+
+Build on existing zig-fuse work to provide:
+
+1. **libfuse3 FFI** - Full FUSE 3.x API access
+2. **Cloud optimizations** - Rate limiting, caching, prefetch
+3. **Cross-platform** - Linux, macOS (macFUSE), FreeBSD
+
+NOT a goal: iOS, Android, Windows, Minix (no FUSE support)
+
+== Methodology
+
+=== Existing Work
+
+Two Zig FUSE libraries exist:
+
+* https://github.com/shanoaice/zig-fuse[zig-fuse] - Raw /dev/fuse, no libfuse
+* https://zigistry.dev/packages/github/PondWader/fuse.zig/[fuse.zig] - Pure Zig, Linux only
+
+**Our approach**: FFI to libfuse3 for maximum compatibility.
+
+=== Why libfuse3 FFI?
+
+[cols="1,2,2"]
+|===
+|Approach |Pros |Cons
+
+|Pure Zig (/dev/fuse)
+|No C dependency
+|Linux only, no macFUSE, no FreeBSD
+
+|libfuse3 FFI
+|Cross-platform, battle-tested
+|C dependency
+
+|libfuse2 FFI
+|Wider availability
+|Deprecated API
+|===
+
+== Implementation
+
+=== Architecture
+
+[source]
+----
+┌─────────────────────────────────────────────────────────────┐
+│                     zig-fuse-ext                            │
+├─────────────────────────────────────────────────────────────┤
+│  High-level API                                             │
+│  - FileSystem interface (Zig trait)                         │
+│  - CloudFileSystem (with rate limiting)                     │
+│  - CachingLayer (write-back, read-ahead)                    │
+├─────────────────────────────────────────────────────────────┤
+│  Low-level bindings                                         │
+│  - fuse_lowlevel_ops                                        │
+│  - fuse_session management                                  │
+│  - Platform-specific mount                                  │
+└─────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    libfuse3 (C)                             │
+│  Linux: /dev/fuse + kernel module                           │
+│  macOS: macFUSE kext                                        │
+│  FreeBSD: fusefs kernel module                              │
+└─────────────────────────────────────────────────────────────┘
+----
+
+=== Directory Structure
+
+[source]
+----
+zig-fuse-ext/
+├── src/
+│   ├── main.zig              # Library root
+│   ├── c.zig                 # @cImport for fuse3
+│   ├── filesystem.zig        # FileSystem trait
+│   ├── operations.zig        # FUSE ops implementation
+│   ├── cloud/
+│   │   ├── rate_limiter.zig  # Token bucket rate limiter
+│   │   ├── cache.zig         # Write-back cache
+│   │   └── prefetch.zig      # Read-ahead prefetch
+│   └── platform/
+│       ├── linux.zig
+│       ├── macos.zig
+│       └── freebsd.zig
+├── build.zig
+└── examples/
+    ├── hello.zig             # Hello world FS
+    ├── passthrough.zig       # Passthrough FS
+    └── cloud_cached.zig      # Cloud with caching
+----
+
+=== FileSystem Trait
+
+[source,zig]
+----
+pub const FileSystem = struct {
+    // Required operations
+    getattr: *const fn (path: []const u8) Error!Stat,
+    readdir: *const fn (path: []const u8) Error!DirIterator,
+    read: *const fn (path: []const u8, buf: []u8, offset: u64) Error!usize,
+
+    // Optional operations
+    write: ?*const fn (path: []const u8, data: []const u8, offset: u64) Error!usize = null,
+    create: ?*const fn (path: []const u8, mode: Mode) Error!void = null,
+    unlink: ?*const fn (path: []const u8) Error!void = null,
+    // ... more ops
+};
+----
+
+=== Cloud-Optimized FileSystem
+
+[source,zig]
+----
+const fuse = @import("zig-fuse-ext");
+
+pub const CloudFs = struct {
+    backend: *rclone.Remote,
+    rate_limiter: fuse.cloud.RateLimiter,
+    cache: fuse.cloud.WriteBackCache,
+
+    pub fn init(remote: []const u8) !CloudFs {
+        return .{
+            .backend = try rclone.Remote.open(remote),
+            .rate_limiter = fuse.cloud.RateLimiter.init(.{
+                .tps = 4,
+                .burst = 1,
+            }),
+            .cache = try fuse.cloud.WriteBackCache.init(.{
+                .mode = .writes,
+                .max_age = 72 * std.time.ns_per_hour,
+            }),
+        };
+    }
+
+    pub fn read(self: *CloudFs, path: []const u8, buf: []u8, offset: u64) !usize {
+        // Check cache first
+        if (self.cache.get(path, offset, buf)) |cached| {
+            return cached;
+        }
+
+        // Rate-limited backend read
+        try self.rate_limiter.acquire();
+        return self.backend.read(path, buf, offset);
+    }
+
+    pub fn write(self: *CloudFs, path: []const u8, data: []const u8, offset: u64) !usize {
+        // Write to cache, async flush to backend
+        return self.cache.write(path, data, offset);
+    }
+};
+
+pub fn main() !void {
+    var fs = try CloudFs.init("dropbox:");
+    defer fs.deinit();
+
+    try fuse.mount("/mnt/cloud", fs.toFileSystem(), .{
+        .allow_other = true,
+        .auto_unmount = true,
+    });
+}
+----
+
+=== Rate Limiter (Token Bucket)
+
+[source,zig]
+----
+pub const RateLimiter = struct {
+    tokens: f64,
+    max_tokens: f64,
+    refill_rate: f64, // tokens per second
+    last_refill: i64,
+    mutex: std.Thread.Mutex,
+
+    pub fn acquire(self: *RateLimiter) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.refill();
+
+        if (self.tokens < 1.0) {
+            const wait_ns = @floatToInt(u64, (1.0 - self.tokens) / self.refill_rate * 1e9);
+            std.time.sleep(wait_ns);
+            self.refill();
+        }
+
+        self.tokens -= 1.0;
+    }
+};
+----
+
+== Platform Support
+
+[cols="1,1,2"]
+|===
+|Platform |Status |Notes
+
+|Linux |✓ Full |libfuse3, kernel 4.2+
+|macOS |✓ Full |macFUSE 4.x required
+|FreeBSD |✓ Full |fusefs-libs
+|Windows |❌ |No FUSE support
+|iOS/Android |❌ |No FUSE support
+|Minix |❌ |No FUSE support
+|===
+
+== Integration
+
+[source,zig]
+----
+// Combined with zig-rclone and zig-wireguard
+const rclone = @import("zig-rclone");
+const wg = @import("zig-wireguard");
+const fuse = @import("zig-fuse-ext");
+
+pub fn secureCloudMount() !void {
+    // 1. Establish VPN
+    var tunnel = try wg.Device.create("wg0");
+    try tunnel.up();
+    defer tunnel.down();
+
+    // 2. Initialize rclone backend
+    try rclone.init();
+    defer rclone.deinit();
+
+    // 3. Mount with rate limiting
+    var fs = try fuse.cloud.CloudFs.init("dropbox:");
+    try fuse.mount("/mnt/secure-cloud", fs.toFileSystem(), .{});
+}
+----
+
+== License
+
+AGPL-3.0-or-later
